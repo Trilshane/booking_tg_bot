@@ -21,6 +21,23 @@ function escapeMarkdown($text)
     return $text;
 }
 
+function saveUser($user_id, $username, $pdo)
+{
+    try {
+        $stmt = $pdo->prepare("
+            INSERT INTO users (telegram_id, username, last_seen) 
+            VALUES (?, ?, NOW())
+            ON DUPLICATE KEY UPDATE 
+                username = VALUES(username),
+                last_seen = NOW()
+        ");
+        $stmt->execute([$user_id, $username]);
+    } catch (Exception $e) {
+        logError("saveUser error: " . $e->getMessage());
+    }
+}
+
+
 try {
     // Подключение к БД
     $pdo = new PDO(
@@ -68,6 +85,8 @@ function handleMessage($message, $pdo)
         $username = $message['from']['username'] ?? 'user_' . $user_id;
         $text = $message['text'] ?? '';
 
+        saveUser($user_id, $username, $pdo);
+
         if (strpos($text, '/start') === 0) {
             showMenu($chat_id, $username);
         } elseif (strpos($text, '/book') === 0 || $text === '📅 Забронировать') {
@@ -92,6 +111,8 @@ function handleCallback($callback, $pdo)
         $username = $callback['from']['username'] ?? 'user_' . $user_id;
         $data = $callback['data'];
         $callback_id = $callback['id'];
+
+        saveUser($user_id, $username, $pdo);
 
         sendTelegramRequest('answerCallbackQuery', [
             'callback_query_id' => $callback_id
@@ -132,6 +153,15 @@ function handleCallback($callback, $pdo)
         } elseif ($data === 'date_today') {
             showBooking($chat_id, $user_id, $username, date('Y-m-d'), $pdo);
         } elseif ($data === 'date_tomorrow') {
+            // ✅ Проверка: можно ли бронировать завтра (только после 12:00)
+            $currentHour = (int)date('H');
+            if ($currentHour < 12) {
+                sendTelegramRequest('sendMessage', [
+                    'chat_id' => $chat_id,
+                    'text' => "⏰ Бронирование на завтра откроется в 12:00\n\nСейчас доступно только сегодня."
+                ]);
+                return;
+            }
             showBooking($chat_id, $user_id, $username, date('Y-m-d', strtotime('+1 day')), $pdo);
         } elseif (strpos($data, 'busy_') === 0 || strpos($data, 'passed_') === 0) {
             sendTelegramRequest('answerCallbackQuery', [
@@ -211,10 +241,24 @@ function showBooking($chat_id, $user_id, $username, $selected_date, $pdo)
 
         $date_label = ($selected_date === $today) ? 'Сегодня' : 'Завтра';
 
+        $can_show_tomorrow = ($currentHour >= 12);
+
         $date_row = [
             ['text' => ($selected_date === $today ? '🔘 Сегодня' : '📅 Сегодня'), 'callback_data' => 'date_today'],
-            ['text' => ($selected_date === $tomorrow ? '🔘 Завтра' : '📅 Завтра'), 'callback_data' => 'date_tomorrow'],
         ];
+
+        // Кнопка "Завтра" (только после 12:00)
+        if ($can_show_tomorrow) {
+            $date_row[] = [
+                'text' => ($selected_date === $tomorrow ? '🔘 Завтра' : '📅 Завтра'),
+                'callback_data' => 'date_tomorrow'
+            ];
+        } else {
+            $date_row[] = [
+                'text' => '🔒 Завтра (с 12:00)',
+                'callback_data' => 'noop'
+            ];
+        }
 
         $keyboard = ['inline_keyboard' => [$date_row]];
         $row = [];
@@ -289,6 +333,17 @@ function bookSlot($chat_id, $user_id, $username, $time, $date, $pdo)
             return;
         }
 
+        if ($date === $tomorrow) {
+            $currentHour = (int)date('H');
+            if ($currentHour < 12) {
+                sendTelegramRequest('sendMessage', [
+                    'chat_id' => $chat_id,
+                    'text' => "⏰ Бронирование на завтра откроется в 12:00"
+                ]);
+                return;
+            }
+        }
+
         if ($date === $today) {
             $currentHour = (int)date('H');
             $slotHour = (int)substr($time, 0, 2);
@@ -349,20 +404,25 @@ function bookSlot($chat_id, $user_id, $username, $time, $date, $pdo)
 function showReport($chat_id, $user_id, $pdo)
 {
     try {
+
+        $yesterday = date('Y-m-d', strtotime('-1 day'));
+        $today = date('Y-m-d');
+        $tomorrow = date('Y-m-d', strtotime('+1 day'));
+
         $stmt = $pdo->prepare("
             SELECT * FROM bookings
-            WHERE booking_date >= DATE_SUB(CURDATE(), INTERVAL ? DAY)
+            WHERE booking_date IN (?, ?, ?)
             AND status IN ('active', 'completed')
             ORDER BY booking_date DESC, time_slot
         ");
-        $stmt->execute([REPORT_DAYS_LIMIT]);
+        $stmt->execute([$yesterday, $today, $tomorrow]);
         $bookings = $stmt->fetchAll();
 
         if (empty($bookings)) {
             $text = "📊 Нет броней за последние " . REPORT_DAYS_LIMIT . " дня";
         } else {
             $text = "📊 *ОТЧЕТ*\n";
-            $text .= "📅 Последние " . REPORT_DAYS_LIMIT . " дня\n\n";
+            $text .= "📅 Текущие " . REPORT_DAYS_LIMIT . " дня\n\n";
             $currentDate = '';
 
             foreach ($bookings as $b) {
